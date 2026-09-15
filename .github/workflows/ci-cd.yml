@@ -7,72 +7,161 @@ on:
     branches: [ "main", "master" ]
 
 jobs:
-  # -------------------------------------------------------------
-  # 1. Build and Test Java Backend
-  # -------------------------------------------------------------
   backend-ci:
     name: Build Backend (Spring Boot)
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-
       - name: Set up JDK 17
         uses: actions/setup-java@v3
         with:
           java-version: '17'
           distribution: 'temurin'
           cache: maven
-
       - name: Build with Maven
         run: |
           cd backend
           mvn clean package -DskipTests
 
-  # -------------------------------------------------------------
-  # 2. Build React Frontend
-  # -------------------------------------------------------------
   frontend-ci:
     name: Build Frontend (React)
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-
       - name: Set up Node.js
         uses: actions/setup-node@v3
         with:
           node-version: '18'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
-
       - name: Install Dependencies & Build
         run: |
           cd frontend
           npm install
           npm run build
 
-  # -------------------------------------------------------------
-  # 3. Docker Compose Build Check
-  # -------------------------------------------------------------
   docker-ci:
-    name: Test Docker Compose Build
+    name: Deploy, Health Check, Rollback
     needs: [backend-ci, frontend-ci]
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Build Docker Containers
-        run: |
-          docker-compose build
+      - name: Restore previous-stable backend image (if any)
+        uses: actions/cache/restore@v4
+        id: stable-cache
+        with:
+          path: /tmp/travelmate-previous-stable.tar
+          key: travelmate-previous-stable-${{ github.run_id }}
+          restore-keys: |
+            travelmate-previous-stable-
 
-      - name: Verify Services Start
+      - name: Load previous-stable image when cache hit
+        if: steps.stable-cache.outputs.cache-matched-key != ''
         run: |
-          docker compose up -d
-          sleep 10
+          if [ -f /tmp/travelmate-previous-stable.tar ]; then
+            docker load -i /tmp/travelmate-previous-stable.tar
+            docker tag travelmate-backend:previous-stable travelmate-backend:previous-stable || true
+            docker images | grep -E 'travelmate|REPOSITORY' || true
+          fi
+
+      - name: Build Docker Containers (candidate deploy)
+        run: |
+          chmod +x scripts/*.sh || true
+          docker compose -f Docker-compose.yml build
+
+      - name: Deploy candidate stack
+        run: |
+          docker compose -f Docker-compose.yml up -d
           docker ps
-          docker compose down
+          echo "Waiting for Spring Boot + MySQL..."
+          sleep 50
+
+      - name: Active health check AFTER deploy (curl x5 → HTTP 200)
+        id: healthcheck
+        run: |
+          set +e
+          URL="http://127.0.0.1:8080/health"
+          echo "==> Active health check against ${URL}"
+          for i in 1 2 3 4 5; do
+            code=$(curl -sS -o /tmp/tm-health-body.txt -w "%{http_code}" --max-time 5 "$URL" || echo "000")
+            body=$(cat /tmp/tm-health-body.txt 2>/dev/null || true)
+            echo "  attempt ${i}/5: HTTP ${code} body=${body}"
+            if [ "$code" = "200" ]; then
+              echo "==> HEALTHY"
+              echo "healthy=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "==> UNHEALTHY after 5 attempts"
+          echo "healthy=false" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: On success — save current backend as previous-stable
+        if: success()
+        run: |
+          IMG=$(docker inspect --format='{{.Image}}' travelmate-backend)
+          docker tag "$IMG" travelmate-backend:previous-stable
+          docker save travelmate-backend:previous-stable -o /tmp/travelmate-previous-stable.tar
+          ls -lh /tmp/travelmate-previous-stable.tar
+          curl -sS -i http://127.0.0.1:8080/health | head -20
+
+      - name: Persist previous-stable image cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/travelmate-previous-stable.tar
+          key: travelmate-previous-stable-${{ github.run_id }}
+
+      - name: Automated rollback on health failure
+        if: failure() && steps.healthcheck.outcome == 'failure'
+        run: |
+          set -e
+          echo "==> ROLLBACK TRIGGERED (if: failure())"
+          docker compose -f Docker-compose.yml stop backend || true
+          docker rm -f travelmate-backend || true
+
+          if ! docker image inspect travelmate-backend:previous-stable >/dev/null 2>&1; then
+            echo "ERROR: no previous-stable image available to roll back to" >&2
+            docker images
+            exit 1
+          fi
+
+          # Discover compose network
+          NET=$(docker network ls --format '{{.Name}}' | grep -E 'travelmate|sampleproject' | head -1)
+          echo "Using network: $NET"
+
+          docker run -d --name travelmate-backend \
+            --network "$NET" \
+            -p 8080:8080 \
+            -e SPRING_DATASOURCE_URL='jdbc:mysql://mysqldb:3306/travelmate_db?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true' \
+            -e SPRING_DATASOURCE_USERNAME=root \
+            -e SPRING_DATASOURCE_PASSWORD=root \
+            -e SPRING_JPA_HIBERNATE_DDL_AUTO=update \
+            travelmate-backend:previous-stable
+
+          echo "==> Waiting after rollback..."
+          sleep 40
+          ok=0
+          for i in 1 2 3 4 5; do
+            code=$(curl -sS -o /tmp/tm-health-body.txt -w "%{http_code}" --max-time 5 http://127.0.0.1:8080/health || echo "000")
+            echo "  post-rollback attempt ${i}/5: HTTP ${code}"
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            sleep 5
+          done
+          docker ps
+          if [ "$ok" != "1" ]; then
+            docker logs travelmate-backend --tail 100 || true
+            exit 1
+          fi
+          echo "==> Rollback successful — /health returns 200"
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose -f Docker-compose.yml down --remove-orphans || true
+          docker rm -f travelmate-backend 2>/dev/null || true
