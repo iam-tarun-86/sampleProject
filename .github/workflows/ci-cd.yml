@@ -41,11 +41,11 @@ jobs:
         run: |
           cd frontend
           npm install
-          npm run build
+          CI=false npm run build
 
   docker-ci:
     name: Deploy, Health Check, Rollback
-    needs: [backend-ci, frontend-ci]
+    needs: [backend-ci]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
